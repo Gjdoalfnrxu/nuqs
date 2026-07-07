@@ -1,6 +1,6 @@
 import { useRouter } from 'next/compat/router.js'
 import type { NextRouter } from 'next/router'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import { debug } from '../../lib/debug'
 import { resetQueues } from '../../lib/queues/reset'
 import { renderQueryString } from '../../lib/url-encoding'
@@ -24,11 +24,78 @@ export function isPagesRouter(): boolean {
 
 let isNuqsUpdateMutex: boolean = false
 
-function onNavigation() {
+export function onNavigation(): void {
   if (isNuqsUpdateMutex) {
     return
   }
   resetQueues()
+}
+
+export function searchParamsFromQuery(
+  query: NextRouter['query'] | undefined
+): URLSearchParams {
+  const searchParams = new URLSearchParams()
+  if (query === undefined) {
+    return searchParams
+  }
+  for (const [key, value] of Object.entries(query)) {
+    if (typeof value === 'string') {
+      searchParams.set(key, value)
+    } else if (Array.isArray(value)) {
+      for (const v of value) {
+        searchParams.append(key, v)
+      }
+    }
+  }
+  return searchParams
+}
+
+export const updatePagesUrl: UpdateUrlFunction = (search, options) => {
+  // While the Next.js team doesn't recommend using internals like this,
+  // we need direct access to the pages router, as a bound/closured version from
+  // useRouter may be out of date by the time the updateUrl function is called,
+  // and would also cause updateUrl to not be referentially stable.
+  const nextRouter = window.next?.router!
+  const urlParams = extractDynamicUrlParams(
+    nextRouter.pathname,
+    nextRouter.query
+  )
+  const asPath =
+    getAsPathPathname(nextRouter.asPath) +
+    renderQueryString(search) +
+    location.hash
+  debug(20, 'next/pages', asPath)
+  const method =
+    options.history === 'push' ? nextRouter.push : nextRouter.replace
+  isNuqsUpdateMutex = true
+  method
+    .call(
+      nextRouter,
+      // This is what makes the URL work (mapping dynamic segments placeholders
+      // in pathname to their values in query, plus search params in query too).
+      {
+        pathname: nextRouter.pathname,
+        query: {
+          // Note: we put search params first so that one that conflicts
+          // with dynamic params will be overwritten.
+          ...urlSearchParamsToObject(search),
+          ...urlParams
+        }
+        // For some reason we don't need to pass the hash here,
+        // it's preserved when passed as part of the asPath.
+      },
+      // This is what makes the URL pretty (resolved dynamic segments
+      // and nuqs-formatted search params).
+      asPath,
+      // And these are the options that are passed to the router.
+      {
+        scroll: options.scroll,
+        shallow: options.shallow
+      }
+    )
+    .finally(() => {
+      isNuqsUpdateMutex = false
+    })
 }
 
 export function useNuqsNextPagesRouterAdapter(): AdapterInterface {
@@ -43,74 +110,14 @@ export function useNuqsNextPagesRouterAdapter(): AdapterInterface {
     }
   }, [])
 
-  const searchParams = useMemo(() => {
-    const searchParams = new URLSearchParams()
-    if (router === null) {
-      return searchParams
-    }
-    for (const [key, value] of Object.entries(router.query)) {
-      if (typeof value === 'string') {
-        searchParams.set(key, value)
-      } else if (Array.isArray(value)) {
-        for (const v of value) {
-          searchParams.append(key, v)
-        }
-      }
-    }
-    return searchParams
-  }, [JSON.stringify(router?.query)])
-
-  const updateUrl: UpdateUrlFunction = useCallback((search, options) => {
-    // While the Next.js team doesn't recommend using internals like this,
-    // we need direct access to the pages router, as a bound/closured version from
-    // useRouter may be out of date by the time the updateUrl function is called,
-    // and would also cause updateUrl to not be referentially stable.
-    const nextRouter = window.next?.router!
-    const urlParams = extractDynamicUrlParams(
-      nextRouter.pathname,
-      nextRouter.query
-    )
-    const asPath =
-      getAsPathPathname(nextRouter.asPath) +
-      renderQueryString(search) +
-      location.hash
-    debug(20, 'next/pages', asPath)
-    const method =
-      options.history === 'push' ? nextRouter.push : nextRouter.replace
-    isNuqsUpdateMutex = true
-    method
-      .call(
-        nextRouter,
-        // This is what makes the URL work (mapping dynamic segments placeholders
-        // in pathname to their values in query, plus search params in query too).
-        {
-          pathname: nextRouter.pathname,
-          query: {
-            // Note: we put search params first so that one that conflicts
-            // with dynamic params will be overwritten.
-            ...urlSearchParamsToObject(search),
-            ...urlParams
-          }
-          // For some reason we don't need to pass the hash here,
-          // it's preserved when passed as part of the asPath.
-        },
-        // This is what makes the URL pretty (resolved dynamic segments
-        // and nuqs-formatted search params).
-        asPath,
-        // And these are the options that are passed to the router.
-        {
-          scroll: options.scroll,
-          shallow: options.shallow
-        }
-      )
-      .finally(() => {
-        isNuqsUpdateMutex = false
-      })
-  }, [])
+  const searchParams = useMemo(
+    () => searchParamsFromQuery(router?.query),
+    [JSON.stringify(router?.query)]
+  )
 
   return {
     searchParams,
-    updateUrl,
+    updateUrl: updatePagesUrl,
     autoResetQueueOnUpdate: false
   }
 }
