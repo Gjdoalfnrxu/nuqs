@@ -1,4 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { render, renderHook } from 'vitest-browser-react'
 import { page, userEvent } from 'vitest/browser'
@@ -219,6 +226,127 @@ describe('useQueryState: referential equality', () => {
     await waitForNextTick()
     await waitForNextTick()
     expect(renders).toBeLessThan(50)
+  })
+
+  // Under React 18 a Date-valued query state can fail to settle at all, with no
+  // remount and nothing writing to the URL after the first commit.
+  //
+  // The shape: a parent writes the param and mounts a child in the same commit,
+  // the child reads the param, derives an object from it, and keys a layout
+  // effect on that object. Because `parse` mints a new Date on each re-derive,
+  // the memo recomputes, the effect re-fires, and the pair never converges.
+  //
+  // Measured on react@18.3.1 / react-dom@18.3.1: this exceeds 80 renders.
+  // On react@19 the same test settles at 4 renders with 3 Date identities, so
+  // the assertion below passes there and fails on 18.
+  it('should settle when a layout effect keys on a value derived from a Date', async () => {
+    const childRenders: string[] = []
+    const dateIdentities = new Set<object>()
+    const effectRuns = { current: 0 }
+
+    function Child() {
+      const [date] = useQueryState('date', parseAsIsoDateTime)
+      const [tick, setTick] = useState(0)
+      const derived = useMemo(() => ({ value: date }), [date])
+
+      childRenders.push(`${date?.toISOString() ?? 'null'}#${tick}`)
+      if (childRenders.length > 80) {
+        throw new Error(`render loop: ${childRenders.length} renders`)
+      }
+      if (date !== null) {
+        dateIdentities.add(date)
+      }
+
+      useLayoutEffect(() => {
+        effectRuns.current++
+        if (effectRuns.current > 40) {
+          return
+        }
+        setTick(t => t + 1)
+      }, [derived])
+
+      return <div>{date?.toISOString() ?? 'null'}</div>
+    }
+
+    function Host() {
+      const [, setDate] = useQueryState('date', parseAsIsoDateTime)
+      const [mode, setMode] = useState<'idle' | 'active'>('idle')
+      return (
+        <>
+          <button
+            onClick={() => {
+              // Same commit: the write and the mount are batched together, so
+              // the child initialises against the pre-write URL.
+              void setDate(new Date('2026-08-07T00:00:00.000Z'))
+              setMode('active')
+            }}
+          >
+            Go
+          </button>
+          {mode === 'active' ? <Child /> : null}
+        </>
+      )
+    }
+
+    render(<Host />, { wrapper: withNuqsTestingAdapter({ searchParams: {} }) })
+    await userEvent.click(page.getByRole('button', { name: 'Go' }))
+    await waitForNextTick()
+    await waitForNextTick()
+    await waitForNextTick()
+
+    expect(childRenders.length).toBeLessThan(10)
+  })
+
+  // Isolates the derived value as the trigger. Identical to the test above
+  // except the layout effect keys on `date` itself. React 18 gives 9 renders
+  // and 3 Date identities here, so it churns but converges; the derived object
+  // is what turns that into an unbounded loop.
+  it('settles when the same layout effect keys on the Date directly', async () => {
+    const childRenders: string[] = []
+    const effectRuns = { current: 0 }
+
+    function Child() {
+      const [date] = useQueryState('date', parseAsIsoDateTime)
+      const [tick, setTick] = useState(0)
+      childRenders.push(`${date?.toISOString() ?? 'null'}#${tick}`)
+      if (childRenders.length > 80) {
+        throw new Error(`render loop: ${childRenders.length} renders`)
+      }
+      useLayoutEffect(() => {
+        effectRuns.current++
+        if (effectRuns.current > 40) {
+          return
+        }
+        setTick(t => t + 1)
+      }, [date])
+      return <div>{date?.toISOString() ?? 'null'}</div>
+    }
+
+    function Host() {
+      const [, setDate] = useQueryState('date', parseAsIsoDateTime)
+      const [mode, setMode] = useState<'idle' | 'active'>('idle')
+      return (
+        <>
+          <button
+            onClick={() => {
+              void setDate(new Date('2026-08-07T00:00:00.000Z'))
+              setMode('active')
+            }}
+          >
+            Go
+          </button>
+          {mode === 'active' ? <Child /> : null}
+        </>
+      )
+    }
+
+    render(<Host />, { wrapper: withNuqsTestingAdapter({ searchParams: {} }) })
+    await userEvent.click(page.getByRole('button', { name: 'Go' }))
+    await waitForNextTick()
+    await waitForNextTick()
+    await waitForNextTick()
+
+    expect(childRenders.length).toBeLessThan(20)
   })
 })
 
